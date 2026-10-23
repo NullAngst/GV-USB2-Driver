@@ -14,6 +14,7 @@
 #define __GVUSB2_H__
 
 #include <linux/module.h>
+#include <linux/usb.h>
 
 #define GVUSB2_NUM_URBS 4
 #define GVUSB2_NUM_ISOCH_PACKETS 0x100
@@ -22,8 +23,16 @@
 #define GVUSB2_VENDOR_ID  0x04bb
 #define GVUSB2_PRODUCT_ID 0x0532
 
+/* timeout for vendor control requests, in milliseconds */
+#define GVUSB2_CTRL_TIMEOUT_MS 1000
+
+/*
+ * These fire from URB completion handlers, many times per second on a
+ * noisy signal. Keep them out of the kernel log unless dynamic debug
+ * is turned on for the module.
+ */
 #define gvusb2_dbg(dev, fmt, args...) \
-	dev_info(dev, fmt, ## args)
+	dev_dbg(dev, fmt, ## args)
 
 struct gvusb2_dev {
 	struct usb_device *udev;

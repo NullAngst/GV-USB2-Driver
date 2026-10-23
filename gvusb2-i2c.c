@@ -13,6 +13,7 @@
 #include <linux/i2c.h>
 #include <linux/delay.h>
 #include <linux/usb.h>
+#include <linux/version.h>
 
 #include "gvusb2.h"
 #include "gvusb2-vid.h"
@@ -20,11 +21,18 @@
 static int gvusb2_i2c_busy_wait(struct gvusb2_vid *dev, u8 wait_mask)
 {
 	int attempts;
+	int ret;
 	u8 flag;
 
-	attempts = 0;
-	while (attempts < 100) {
-		gvusb2_read_reg(&dev->gv, 0x0201, &flag);
+	/*
+	 * Each poll is a USB control transfer, so 100 attempts is already
+	 * tens of milliseconds. The old loop never counted, which hung the
+	 * kernel thread forever if the device went away mid-transfer.
+	 */
+	for (attempts = 0; attempts < 100; attempts++) {
+		ret = gvusb2_read_reg(&dev->gv, 0x0201, &flag);
+		if (ret < 0)
+			return ret;
 		if (flag & wait_mask)
 			return 0;
 	}
@@ -32,7 +40,8 @@ static int gvusb2_i2c_busy_wait(struct gvusb2_vid *dev, u8 wait_mask)
 	return -ETIMEDOUT;
 }
 
-int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 *value)
+static int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg,
+	u8 *value)
 {
 	int ret;
 
@@ -63,7 +72,8 @@ int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 *value)
 	return 0;
 }
 
-int gvusb2_i2c_write_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 value)
+static int gvusb2_i2c_write_reg(struct gvusb2_vid *dev, u8 addr, u8 reg,
+	u8 value)
 {
 	int ret;
 
@@ -108,6 +118,7 @@ static int gvusb2_i2c_xfer(struct i2c_adapter *i2c_adap, struct i2c_msg msgs[],
 		if (i + 1 < num && msgs[i].len == 1 &&
 		   ((msgs[i].flags & I2C_M_RD) == 0) &&
 		   (msgs[i + 1].flags & I2C_M_RD) &&
+		   msgs[i + 1].len == 1 &&
 		   msgs[i].addr == msgs[i + 1].addr) {
 			dev_dbg(&dev->intf->dev,
 				" subaddr=%02x", msgs[i].buf[0]);
@@ -123,7 +134,8 @@ static int gvusb2_i2c_xfer(struct i2c_adapter *i2c_adap, struct i2c_msg msgs[],
 				" read=%02x\n", msgs[i + 1].buf[0]);
 
 			i++;
-		} else if (msgs[i].len == 2) {
+		} else if (msgs[i].len == 2 &&
+			   (msgs[i].flags & I2C_M_RD) == 0) {
 			dev_dbg(&dev->intf->dev, " subaddr=%02x write=%02x\n",
 				msgs[i].buf[0], msgs[i].buf[1]);
 
@@ -148,7 +160,12 @@ static u32 gvusb2_i2c_functionality(struct i2c_adapter *adap)
 }
 
 static const struct i2c_algorithm gvusb2_i2c_algo = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	/* master_xfer is deprecated since 6.11 and slated for removal */
+	.xfer = gvusb2_i2c_xfer,
+#else
 	.master_xfer = gvusb2_i2c_xfer,
+#endif
 	.functionality = gvusb2_i2c_functionality,
 };
 
@@ -165,9 +182,6 @@ int gvusb2_i2c_register(struct gvusb2_vid *dev)
 	/* maybe set this to just dev? */
 	adap->algo_data = dev;
 
-	/* is this needed? */
-	//i2c_set_adapdata(adap, &dev->v4l2_dev);
-
 	ret = i2c_add_adapter(adap);
 	if (ret < 0)
 		return ret;
@@ -178,12 +192,20 @@ int gvusb2_i2c_register(struct gvusb2_vid *dev)
 	client->addr = 0x44;
 
 	/* set i2c clock divider */
-	gvusb2_write_reg(&dev->gv, 0x0202, 0x08);
+	ret = gvusb2_write_reg(&dev->gv, 0x0202, 0x08);
+	if (ret < 0)
+		goto del_adapter;
 
 	/* disable alternate i2c */
-	gvusb2_write_reg(&dev->gv, 0x02ff, 0x00);
+	ret = gvusb2_write_reg(&dev->gv, 0x02ff, 0x00);
+	if (ret < 0)
+		goto del_adapter;
 
 	return 0;
+
+del_adapter:
+	i2c_del_adapter(adap);
+	return ret;
 }
 
 int gvusb2_i2c_unregister(struct gvusb2_vid *dev)

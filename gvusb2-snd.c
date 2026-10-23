@@ -13,8 +13,8 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
-#include <linux/vmalloc.h>
 #include <sound/core.h>
+#include <sound/initval.h>
 #include <sound/pcm.h>
 
 #include "gvusb2.h"
@@ -25,16 +25,18 @@ MODULE_DESCRIPTION("gvusb2 sound driver");
 MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
 
-int index;
-char *id;
-bool enable;
+/*
+ * Default to the first free slot. The old default of 0 failed with
+ * -EBUSY whenever onboard audio already held card 0.
+ */
+static int card_index = SNDRV_DEFAULT_IDX1;
+static char *card_id = SNDRV_DEFAULT_STR1;
 
-module_param(index, int, 0444);
+/* exposed as index= and id= like every other ALSA driver */
+module_param_named(index, card_index, int, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
-module_param(id, charp, 0444);
+module_param_named(id, card_id, charp, 0444);
 MODULE_PARM_DESC(id, "ID string for " CARD_NAME " soundcard.");
-module_param(enable, bool, 0444);
-MODULE_PARM_DESC(enable, "Enable " CARD_NAME " soundcard.");
 
 static const struct usb_device_id gvusb2_id_table[] = {
 	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
@@ -42,6 +44,7 @@ static const struct usb_device_id gvusb2_id_table[] = {
 };
 MODULE_DEVICE_TABLE(usb, gvusb2_id_table);
 
+/* lives in snd_card->private_data, so it is freed together with the card */
 struct gvusb2_snd {
 	struct gvusb2_dev gv;
 	struct usb_interface *intf;
@@ -53,14 +56,16 @@ struct gvusb2_snd {
 	/* alsa */
 	struct snd_card *card;
 	struct snd_pcm *pcm;
-	struct snd_pcm_substream *substream;
-	int dma_offset;
-	int avail;
-	int hw_ptr;
+
+	/* everything below is protected by lock */
 	spinlock_t lock;
+	struct snd_pcm_substream *substream;
+	bool running;
+	unsigned int dma_offset;	/* write position, bytes */
+	unsigned int period_bytes;	/* bytes since the last period */
 };
 
-static struct snd_pcm_hardware gvusb2_snd_hw = {
+static const struct snd_pcm_hardware gvusb2_snd_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
@@ -86,44 +91,38 @@ static void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev);
  *  Alsa Stuff
  ****************************************************************************/
 
-void gvusb2_snd_process_pcm(
-	struct gvusb2_snd *dev,
-	unsigned char *buf,
-	unsigned int len)
+/*
+ * Copy one packet into the ring buffer. Called with dev->lock held and
+ * only while the stream is running, which is the window in which ALSA
+ * guarantees dma_area exists. Returns true when a period boundary passed.
+ */
+static bool gvusb2_snd_copy_pcm(struct gvusb2_snd *dev,
+	struct snd_pcm_runtime *runtime, const u8 *buf, unsigned int len)
 {
-	unsigned long flags;
-	struct snd_pcm_runtime *runtime = dev->substream->runtime;
-	int frames = bytes_to_frames(runtime, len);
+	unsigned int buffer_bytes = frames_to_bytes(runtime,
+		runtime->buffer_size);
+	unsigned int period_bytes = frames_to_bytes(runtime,
+		runtime->period_size);
 
-	spin_lock_irqsave(&dev->lock, flags);
-	dev->hw_ptr += frames;
-	if (dev->hw_ptr >= runtime->buffer_size)
-		dev->hw_ptr -= runtime->buffer_size;
+	while (len > 0) {
+		unsigned int chunk = min(len, buffer_bytes - dev->dma_offset);
 
-	dev->avail += frames;
-	spin_unlock_irqrestore(&dev->lock, flags);
+		memcpy(runtime->dma_area + dev->dma_offset, buf, chunk);
+		dev->dma_offset += chunk;
+		if (dev->dma_offset >= buffer_bytes)
+			dev->dma_offset = 0;
 
-	if (dev->dma_offset + len > runtime->dma_bytes) {
-		int len_to_copy = runtime->dma_bytes - dev->dma_offset;
-
-		memcpy(runtime->dma_area + dev->dma_offset, buf, len_to_copy);
-
-		len -= len_to_copy;
-		buf += len_to_copy;
-		dev->dma_offset = 0;
+		dev->period_bytes += chunk;
+		buf += chunk;
+		len -= chunk;
 	}
 
-	memcpy(runtime->dma_area + dev->dma_offset, buf, len);
-	dev->dma_offset += len;
-
-	spin_lock_irqsave(&dev->lock, flags);
-	if (dev->avail >= runtime->period_size) {
-		dev->avail -= runtime->period_size;
-		spin_unlock_irqrestore(&dev->lock, flags);
-		snd_pcm_period_elapsed(dev->substream);
-		return;
+	if (dev->period_bytes >= period_bytes) {
+		dev->period_bytes %= period_bytes;
+		return true;
 	}
-	spin_unlock_irqrestore(&dev->lock, flags);
+
+	return false;
 }
 
 static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
@@ -131,179 +130,125 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 	int ret;
 	unsigned long flags;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
-	struct snd_pcm_runtime *runtime = substream->runtime;
 
-	ret = gvusb2_snd_submit_isoc(dev);
-	if (ret < 0)
-		return ret;
+	substream->runtime->hw = gvusb2_snd_hw;
 
 	spin_lock_irqsave(&dev->lock, flags);
-	if (dev->substream == NULL) {
-		dev->substream = substream;
-		runtime->hw = gvusb2_snd_hw;
-		ret = 0;
-	} else {
-		ret = -EBUSY;
-	}
+	dev->substream = substream;
+	dev->running = false;
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	/*
+	 * The URBs run from open to close. Data is dropped until the
+	 * stream is triggered, see gvusb2_snd_process_isoc().
+	 */
+	ret = gvusb2_snd_submit_isoc(dev);
+	if (ret < 0) {
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->substream = NULL;
+		spin_unlock_irqrestore(&dev->lock, flags);
+	}
 
 	return ret;
 }
 
 static int gvusb2_snd_capture_close(struct snd_pcm_substream *substream)
 {
+	unsigned long flags;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 
-	dev->substream = NULL;
+	/* stop the URBs first so no completion can see a stale substream */
 	gvusb2_snd_cancel_isoc(dev);
 
-	return 0;
-}
-
-static int gvusb2_snd_hw_params(
-	struct snd_pcm_substream *substream,
-	struct snd_pcm_hw_params *hw_params)
-{
-	unsigned int bytes;
-
-	bytes = params_buffer_bytes(hw_params);
-	if (substream->runtime->dma_bytes > 0)
-		vfree(substream->runtime->dma_area);
-
-	substream->runtime->dma_bytes = 0;
-	substream->runtime->dma_area = vmalloc(bytes);
-	if (substream->runtime->dma_area == NULL)
-		return -ENOMEM;
-
-	substream->runtime->dma_bytes = bytes;
-
-	return 0;
-}
-
-static int gvusb2_snd_hw_free(struct snd_pcm_substream *substream)
-{
-	if (substream->runtime->dma_bytes > 0)
-		vfree(substream->runtime->dma_area);
-
-	substream->runtime->dma_bytes = 0;
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->running = false;
+	dev->substream = NULL;
+	spin_unlock_irqrestore(&dev->lock, flags);
 
 	return 0;
 }
 
 static int gvusb2_snd_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	/* TODO: Do we need this? */
+	unsigned long flags;
+	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
+
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->dma_offset = 0;
+	dev->period_bytes = 0;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
 	return 0;
 }
 
 /* NOTE: THIS IS ATOMIC */
 static int gvusb2_snd_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+	unsigned long flags;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->running = true;
+		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		dev->dma_offset = 0;
-		dev->hw_ptr = 0;
-		dev->avail = 0;
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->running = false;
+		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
 	default:
 		return -EINVAL;
 	}
-
-	return 0;
 }
 
 /* NOTE: THIS IS ATOMIC */
 static snd_pcm_uframes_t gvusb2_snd_pcm_pointer(
 	struct snd_pcm_substream *substream)
 {
+	unsigned long flags;
+	snd_pcm_uframes_t pos;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 
-	return dev->hw_ptr;
+	spin_lock_irqsave(&dev->lock, flags);
+	pos = bytes_to_frames(substream->runtime, dev->dma_offset);
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	return pos;
 }
-
-static struct page *gvusb2_snd_pcm_page(
-	struct snd_pcm_substream *substream,
-	unsigned long offset)
-{
-	return vmalloc_to_page(substream->runtime->dma_area + offset);
-}
-
-static int gvusb2_snd_dev_free(struct snd_device *device)
-{
-	/* deallocate all sound card device stuff */
-	/* TODO: do we need this? */
-
-	return 0;
-}
-
-static struct snd_device_ops gvusb2_snd_device_ops = {
-	.dev_free = gvusb2_snd_dev_free,
-};
 
 static const struct snd_pcm_ops gvusb2_snd_capture_ops = {
 	.open      = gvusb2_snd_capture_open,
 	.close     = gvusb2_snd_capture_close,
-	.ioctl     = snd_pcm_lib_ioctl,
-	.hw_params = gvusb2_snd_hw_params,
-	.hw_free   = gvusb2_snd_hw_free,
 	.prepare   = gvusb2_snd_pcm_prepare,
 	.trigger   = gvusb2_snd_pcm_trigger,
 	.pointer   = gvusb2_snd_pcm_pointer,
-	.page      = gvusb2_snd_pcm_page,
 };
 
-int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
+static int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 {
 	int ret;
 
-	spin_lock_init(&dev->lock);
-	dev->hw_ptr = dev->dma_offset = dev->avail = 0;
-
-	ret = snd_card_new(&dev->intf->dev, index, id, THIS_MODULE, 0,
-			&dev->card);
+	ret = snd_pcm_new(dev->card, "analog in", 0, 0, 1, &dev->pcm);
 	if (ret < 0)
 		return ret;
-
-	ret = snd_device_new(dev->card, SNDRV_DEV_LOWLEVEL, dev,
-		&gvusb2_snd_device_ops);
-	if (ret < 0) {
-		snd_card_free(dev->card);
-		return ret;
-	}
-
-	ret = snd_pcm_new(dev->card, "analog in", 0, 0, 1, &dev->pcm);
-	if (ret < 0) {
-		snd_card_free(dev->card);
-		return ret;
-	}
 
 	dev->pcm->private_data = dev;
 
 	snd_pcm_set_ops(dev->pcm, SNDRV_PCM_STREAM_CAPTURE,
 		&gvusb2_snd_capture_ops);
 
+	/* ALSA allocates and frees the vmalloc ring buffer for us */
+	snd_pcm_set_managed_buffer_all(dev->pcm, SNDRV_DMA_TYPE_VMALLOC,
+		NULL, 0, 0);
+
 	strscpy(dev->card->shortname, "gvusb2", sizeof(dev->card->shortname));
 	strscpy(dev->card->longname, "gvusb2", sizeof(dev->card->longname));
 	strscpy(dev->card->driver, "gvusb2-snd", sizeof(dev->card->driver));
 
-	/* register the card */
-	ret = snd_card_register(dev->card);
-	if (ret < 0) {
-		snd_card_free(dev->card);
-		return ret;
-	}
-
-	return 0;
-}
-
-static void gvusb2_snd_alsa_free(struct gvusb2_snd *dev)
-{
-	snd_card_free_when_closed(dev->card);
-	dev->card = NULL;
+	return snd_card_register(dev->card);
 }
 
 /*****************************************************************************
@@ -311,19 +256,15 @@ static void gvusb2_snd_alsa_free(struct gvusb2_snd *dev)
  ****************************************************************************/
 
 /* Do not call in atomic contexts */
-void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev)
+static void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev)
 {
 	int i;
 
-	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
-		struct urb *urb = dev->urbs[i];
-
-		if (urb != NULL)
-			usb_kill_urb(dev->urbs[i]);
-	}
+	for (i = 0; i < GVUSB2_NUM_URBS; i++)
+		usb_kill_urb(dev->urbs[i]);
 }
 
-void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
+static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 {
 	int i;
 
@@ -331,35 +272,48 @@ void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 		struct urb *urb = dev->urbs[i];
 
 		if (urb != NULL) {
-			if (urb->transfer_buffer != NULL)
-				kfree(urb->transfer_buffer);
+			kfree(urb->transfer_buffer);
 			usb_free_urb(urb);
 			dev->urbs[i] = NULL;
 		}
 	}
 }
 
-void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
+static void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
 {
 	int i;
-	unsigned char *buf_iter;
+	unsigned long flags;
+	bool elapsed = false;
+	struct snd_pcm_substream *substream;
 
-	if (dev->substream == NULL) {
-		gvusb2_dbg(&dev->intf->dev, "substream is null, skipping processing\n");
+	spin_lock_irqsave(&dev->lock, flags);
+
+	substream = dev->substream;
+	if (substream == NULL || !dev->running) {
+		spin_unlock_irqrestore(&dev->lock, flags);
 		return;
 	}
 
-	buf_iter = urb->transfer_buffer;
 	for (i = 0; i < urb->number_of_packets; i++) {
-		if (urb->iso_frame_desc[i].status < 0) {
-			gvusb2_dbg(&dev->intf->dev, "bad iso packet. skipping.\n");
-		} else {
-			gvusb2_snd_process_pcm(dev,
-				buf_iter, urb->iso_frame_desc[i].actual_length);
+		struct usb_iso_packet_descriptor *desc = &urb->iso_frame_desc[i];
+
+		if (desc->status < 0) {
+			gvusb2_dbg(&dev->intf->dev,
+				"bad iso packet (%d), skipping\n", desc->status);
+			continue;
 		}
 
-		buf_iter += urb->iso_frame_desc[i].length;
+		if (gvusb2_snd_copy_pcm(dev, substream->runtime,
+				urb->transfer_buffer + desc->offset,
+				desc->actual_length))
+			elapsed = true;
 	}
+
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	/* safe outside the lock, ALSA ignores it if the stream stopped */
+	if (elapsed)
+		snd_pcm_period_elapsed(substream);
 }
 
 static void gvusb2_snd_isoc_irq(struct urb *urb)
@@ -398,10 +352,13 @@ static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev)
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
-		if (ret < 0)
-			/* TODO: clean up */
-			gvusb2_dbg(&dev->intf->dev,
-				"error submitting urb %d\n", ret);
+		if (ret < 0) {
+			dev_err(&dev->intf->dev,
+				"error submitting urb (%d)\n", ret);
+			while (--i >= 0)
+				usb_kill_urb(dev->urbs[i]);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -458,12 +415,24 @@ free_urbs:
  * Driver Stuff
  ****************************************************************************/
 
-int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
+/* runs when the card is finally freed, after the last close */
+static void gvusb2_snd_card_free(struct snd_card *card)
+{
+	struct gvusb2_snd *dev = card->private_data;
+
+	gvusb2_snd_free_isoc(dev);
+	gvusb2_free(&dev->gv);
+}
+
+static int gvusb2_snd_probe(struct usb_interface *intf,
+	const struct usb_device_id *id)
 {
 	struct usb_device *udev;
+	struct snd_card *card;
 	struct gvusb2_snd *dev;
 	int i, ret;
 	struct usb_endpoint_descriptor *audio_ep = NULL;
+	struct usb_host_interface *audio_alt = NULL;
 
 	udev = interface_to_usbdev(intf);
 
@@ -485,9 +454,11 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 			if (usb_endpoint_dir_in(e) &&
 					e->bEndpointAddress == 0x84 &&
 					usb_endpoint_xfer_isoc(e) &&
-					e->wMaxPacketSize == 0x100) {
+					le16_to_cpu(e->wMaxPacketSize) == 0x100) {
 				audio_ep = e;
-				gvusb2_dbg(&intf->dev, "found audio at altsetting %d endpoint %d\n",
+				audio_alt = &intf->altsetting[i];
+				gvusb2_dbg(&intf->dev,
+					"found audio at altsetting %d endpoint %d\n",
 					i, ep);
 			}
 		}
@@ -497,76 +468,78 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (audio_ep == NULL)
 		return -ENODEV;
 
-	/* allocate our driver data */
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (dev == NULL)
-		return -ENOMEM;
+	/* our state is allocated as part of the card */
+	ret = snd_card_new(&intf->dev, card_index, card_id, THIS_MODULE,
+		sizeof(*dev), &card);
+	if (ret < 0)
+		return ret;
+
+	dev = card->private_data;
+	dev->card = card;
+	dev->intf = intf;
+	dev->ep = audio_ep;
+	spin_lock_init(&dev->lock);
 
 	/* initialize gvusb2 core stuff */
 	ret = gvusb2_init(&dev->gv, udev);
 	if (ret < 0)
-		goto free_dev;
+		goto free_card;
+	card->private_free = gvusb2_snd_card_free;
 
-	/* XXX: No hardcoding here. */
-	ret = usb_set_interface(udev, 2, 1);
+	/* select the altsetting that carries the audio endpoint */
+	ret = usb_set_interface(udev, audio_alt->desc.bInterfaceNumber,
+		audio_alt->desc.bAlternateSetting);
 	if (ret < 0)
-		goto free_gvusb2;
+		goto free_card;
 
 	/* reset the adc */
 	ret = gvusb2_snd_reset_adc(&dev->gv);
 	if (ret < 0)
-		goto free_gvusb2;
-
-	/* initialize gvusb2_snd data */
-	dev->ep = audio_ep;
-	dev->intf = intf;
-
-	/* initialize sound stuff */
-	ret = gvusb2_snd_alsa_init(dev);
-	if (ret < 0)
-		goto free_gvusb2;
+		goto free_card;
 
 	/* allocate URBs */
 	ret = gvusb2_snd_allocate_urbs(dev);
 	if (ret < 0)
-		goto free_alsa;
+		goto free_card;
+
+	/* initialize sound stuff */
+	ret = gvusb2_snd_alsa_init(dev);
+	if (ret < 0)
+		goto free_card;
 
 	/* attach our data to the interface */
 	usb_set_intfdata(intf, dev);
 
 	return 0;
 
-free_alsa:
-	gvusb2_snd_alsa_free(dev);
-
-free_gvusb2:
-	gvusb2_free(&dev->gv);
-
-free_dev:
-	kfree(dev);
+free_card:
+	/* runs gvusb2_snd_card_free() once private_free is set */
+	snd_card_free(card);
 
 	return ret;
 }
 
-void gvusb2_snd_disconnect(struct usb_interface *intf)
+static void gvusb2_snd_disconnect(struct usb_interface *intf)
 {
 	struct gvusb2_snd *dev;
 
 	/* remove our data from the interface */
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
+	if (dev == NULL)
+		return;
 
-	/* free isoc urbs */
-	gvusb2_snd_free_isoc(dev);
+	/* stop running streams and refuse new opens */
+	snd_card_disconnect(dev->card);
 
-	/* free the sound card */
-	gvusb2_snd_alsa_free(dev);
+	/* make sure no completion handler is still touching the card */
+	gvusb2_snd_cancel_isoc(dev);
 
-	/* free the internal gvusb2 device */
-	gvusb2_free(&dev->gv);
-
-	/* free me */
-	kfree(dev);
+	/*
+	 * dev lives inside the card. It and the URBs are freed by
+	 * gvusb2_snd_card_free() once the last open file is closed.
+	 */
+	snd_card_free_when_closed(dev->card);
 }
 
 static struct usb_driver gvusb2_snd_usb_driver = {

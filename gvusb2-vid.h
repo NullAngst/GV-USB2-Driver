@@ -57,6 +57,8 @@ struct gvusb2_vid {
 	struct v4l2_subdev *sd_tw9910;
 	struct video_device vdev;
 	struct v4l2_ctrl_handler ctrl_handler;
+	struct v4l2_ctrl *ctrl_vstart;
+	struct v4l2_ctrl *ctrl_hstart;
 	struct mutex v4l2_lock;
 	unsigned int input_num;
 	unsigned int sequence;
@@ -77,7 +79,8 @@ void gvusb2_vid_cancel_urbs(struct gvusb2_vid *dev);
 
 /* provided by gvusb2-v4l2.c */
 void get_resolution(struct gvusb2_vid *dev, int *width, int *height);
-void gvusb2_vid_clear_queue(struct gvusb2_vid *dev);
+void gvusb2_vid_clear_queue(struct gvusb2_vid *dev,
+	enum vb2_buffer_state state);
 int gvusb2_vb2_setup(struct gvusb2_vid *dev);
 int gvusb2_v4l2_register(struct gvusb2_vid *dev);
 void gvusb2_v4l2_unregister(struct gvusb2_vid *dev);

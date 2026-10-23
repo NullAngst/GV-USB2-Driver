@@ -17,23 +17,31 @@
 #include "gvusb2.h"
 #include "gvusb2-regs.h"
 
+MODULE_DESCRIPTION("gvusb2 shared register access");
+MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
+MODULE_LICENSE("Dual BSD/GPL");
+
 int gvusb2_read_reg(struct gvusb2_dev *dev, u16 reg, u8 *value)
 {
 	int ret;
 	int pipe = usb_rcvctrlpipe(dev->udev, 0);
 	u8 *buf;
 
+	*value = 0;
+
+	/* usb_control_msg() needs a DMA-safe buffer, so no stack memory */
 	buf = kmalloc(sizeof(u8), GFP_KERNEL);
 	if (buf == NULL)
 		return -ENOMEM;
 
-	*value = 0;
 	ret = usb_control_msg(dev->udev, pipe, 0x00,
 		USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-		0x00, reg, buf, sizeof(u8), HZ);
+		0x00, reg, buf, sizeof(u8), GVUSB2_CTRL_TIMEOUT_MS);
+	if (ret >= 0 && ret != sizeof(u8))
+		ret = -EIO;
 	if (ret < 0) {
-		pr_err("gvusb2: read failed on reg 0x%04x (%d)\n",
-			reg, ret);
+		dev_err_ratelimited(&dev->udev->dev,
+			"read failed on reg 0x%04x (%d)\n", reg, ret);
 		kfree(buf);
 		return ret;
 	}
@@ -44,6 +52,7 @@ int gvusb2_read_reg(struct gvusb2_dev *dev, u16 reg, u8 *value)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(gvusb2_read_reg);
 
 int gvusb2_write_reg(struct gvusb2_dev *dev, u16 reg, u8 value)
 {
@@ -52,15 +61,16 @@ int gvusb2_write_reg(struct gvusb2_dev *dev, u16 reg, u8 value)
 
 	ret = usb_control_msg(dev->udev, pipe, 0x01,
 		USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-		value, reg, NULL, 0, HZ);
+		value, reg, NULL, 0, GVUSB2_CTRL_TIMEOUT_MS);
 	if (ret < 0) {
-		pr_err("gvusb2: write failed on reg 0x%04x (%d)\n",
-			reg, ret);
+		dev_err_ratelimited(&dev->udev->dev,
+			"write failed on reg 0x%04x (%d)\n", reg, ret);
 		return ret;
 	}
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(gvusb2_write_reg);
 
 int gvusb2_set_reg_mask(struct gvusb2_dev *dev, u16 reg, u8 mask, u8 value)
 {
@@ -71,37 +81,47 @@ int gvusb2_set_reg_mask(struct gvusb2_dev *dev, u16 reg, u8 mask, u8 value)
 	if (ret < 0)
 		return ret;
 
-	gvusb2_write_reg(dev, reg, (reg_val & ~mask) | value);
-	if (ret < 0)
-		return ret;
-
-	return 0;
+	return gvusb2_write_reg(dev, reg, (reg_val & ~mask) | value);
 }
+EXPORT_SYMBOL_GPL(gvusb2_set_reg_mask);
 
 int gvusb2_init(struct gvusb2_dev *dev, struct usb_device *udev)
 {
-	dev->udev = udev;
+	/*
+	 * Hold a reference so register access from a late close() after
+	 * an unplug fails cleanly instead of touching freed memory.
+	 */
+	dev->udev = usb_get_dev(udev);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(gvusb2_init);
 
 int gvusb2_free(struct gvusb2_dev *dev)
 {
-	/* nothing here, yet */
+	usb_put_dev(dev->udev);
+	dev->udev = NULL;
 	return 0;
 }
+EXPORT_SYMBOL_GPL(gvusb2_free);
 
 int gvusb2_snd_reset_adc(struct gvusb2_dev *dev)
 {
-	/* TODO: return errors */
+	int ret;
 
 	/* set audio GPIO pins to output */
-	gvusb2_set_reg_mask(dev, 0x0002, 0x30, 0x30);
-	gvusb2_set_reg_mask(dev, 0x0000, 0x30, 0x10);
+	ret = gvusb2_set_reg_mask(dev, 0x0002, 0x30, 0x30);
+	if (ret < 0)
+		return ret;
+	ret = gvusb2_set_reg_mask(dev, 0x0000, 0x30, 0x10);
+	if (ret < 0)
+		return ret;
 
 	/* disable AC97 interface */
-	gvusb2_write_reg(dev, 0x0500, 0x00);
-	/* enable I2S interface */
-	gvusb2_write_reg(dev, 0x050c, 0x01);
+	ret = gvusb2_write_reg(dev, 0x0500, 0x00);
+	if (ret < 0)
+		return ret;
 
-	return 0;
+	/* enable I2S interface */
+	return gvusb2_write_reg(dev, 0x050c, 0x01);
 }
+EXPORT_SYMBOL_GPL(gvusb2_snd_reset_adc);

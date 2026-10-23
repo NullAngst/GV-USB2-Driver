@@ -59,7 +59,7 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 	u32 buffer_len = vb->vb.vb2_buf.planes[0].length;
 	u8 *buffer_addr = vb2_plane_vaddr(&vb->vb.vb2_buf, 0);
 
-	get_resolution(dev, &width, 0);
+	get_resolution(dev, &width, NULL);
 	bytes_per_line = width * 2;
 
 	while (len > 0) {
@@ -72,12 +72,9 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 			len_to_copy = bytes_left_in_line;
 
 		if (vb->buf_pos + len_to_copy > buffer_len) {
-			dev_warn(&dev->intf->dev,
+			/* more lines than the frame holds, drop the rest */
+			dev_warn_ratelimited(&dev->intf->dev,
 				"buffer overflow detected.\n");
-
-			/* this seems to break it somehow? */
-//            memcpy(vb2_plane_vaddr(&vb->vb.vb2_buf, 0) + vb->buf_pos,
-//                        buf, vb->vb.vb2_buf.planes[0].length - vb->buf_pos);
 			return;
 		}
 
@@ -129,7 +126,7 @@ void gvusb2_vid_process_status_packet(struct gvusb2_vid *dev, u8 status_byte)
 		/* even field */
 		int width;
 
-		get_resolution(dev, &width, 0);
+		get_resolution(dev, &width, NULL);
 		dev->current_buf->buf_pos = width * 2;
 		dev->current_buf->line_pos = 0;
 
@@ -224,7 +221,7 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
  * USB functions
  ****************************************************************************/
 
-void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
+static void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
 {
 	int i;
 
@@ -240,7 +237,7 @@ void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
 	}
 }
 
-int gvusb2_vid_allocate_urbs(struct gvusb2_vid *dev)
+static int gvusb2_vid_allocate_urbs(struct gvusb2_vid *dev)
 {
 	int i;
 
@@ -294,8 +291,11 @@ int gvusb2_vid_submit_urbs(struct gvusb2_vid *dev)
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
 		if (ret < 0) {
-			gvusb2_dbg(&dev->intf->dev,
+			dev_err(&dev->intf->dev,
 				"urb submit failed (%d)\n", ret);
+			/* don't leave the ones that made it running */
+			while (--i >= 0)
+				usb_kill_urb(dev->urbs[i]);
 			return ret;
 		}
 	}
@@ -320,17 +320,22 @@ struct regval {
 	u8 val;
 };
 
-static void gvusb2_stk1150_reset_gpio(struct gvusb2_vid *dev)
+static int gvusb2_stk1150_reset_gpio(struct gvusb2_vid *dev)
 {
+	int ret;
+
 	/* set video decoder pin to output */
-	gvusb2_set_reg_mask(&dev->gv, 0x0002, 0x08, 0x08);
+	ret = gvusb2_set_reg_mask(&dev->gv, 0x0002, 0x08, 0x08);
+	if (ret < 0)
+		return ret;
+
 	/* set video decoder pin to high */
-	gvusb2_set_reg_mask(&dev->gv, 0x0000, 0x08, 0x08);
+	return gvusb2_set_reg_mask(&dev->gv, 0x0000, 0x08, 0x08);
 }
 
-static void gvusb2_stk1150_init_inner(struct gvusb2_vid *dev)
+static int gvusb2_stk1150_init_inner(struct gvusb2_vid *dev)
 {
-	int i;
+	int i, ret;
 
 	static const struct regval phase3[] = {
 		{0x000d, 0x00},
@@ -348,42 +353,58 @@ static void gvusb2_stk1150_init_inner(struct gvusb2_vid *dev)
 		{0x0300, 0x80},
 		{0x0018, 0x10},
 		{0x0103, 0x00},
-		//{0x0110, 0x03},
-		//{0x0111, 0x00},
-		//{0x0112, 0x02},
-		//{0x0113, 0x00},
-		//{0x0114, 0xa3},
-		//{0x0115, 0x05},
-		//{0x0116, 0xf2},
-		//{0x0117, 0x00},
+		/* 0x0110-0x0117 (capture window) come from the controls */
 		{0x0100, 0x33},
 		{0x0202, 0x08},
 
 		{0xffff, 0xff}
 	};
 
-	for (i = 0; phase3[i].reg != 0xffff; i++)
-		gvusb2_write_reg(&dev->gv, phase3[i].reg, phase3[i].val);
+	for (i = 0; phase3[i].reg != 0xffff; i++) {
+		ret = gvusb2_write_reg(&dev->gv, phase3[i].reg, phase3[i].val);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
 }
 
-static void gvusb2_stk1150_reset_slave_ics(struct gvusb2_vid *dev)
+static int gvusb2_stk1150_reset_slave_ics(struct gvusb2_vid *dev)
 {
+	int ret;
 	u8 reg_0000;
 
-	gvusb2_read_reg(&dev->gv, 0x0000, &reg_0000);
+	ret = gvusb2_read_reg(&dev->gv, 0x0000, &reg_0000);
+	if (ret < 0)
+		return ret;
 
 	/* toggle video decoder slave reset pins via GPIO */
-	gvusb2_write_reg(&dev->gv, 0x0000, reg_0000 & 0xf7);
+	ret = gvusb2_write_reg(&dev->gv, 0x0000, reg_0000 & 0xf7);
+	if (ret < 0)
+		return ret;
 	usleep_range(10 * USEC_PER_MSEC, 20 * USEC_PER_MSEC);
-	gvusb2_write_reg(&dev->gv, 0x0000, (reg_0000 & 0xf7) | 0x08);
+
+	ret = gvusb2_write_reg(&dev->gv, 0x0000, (reg_0000 & 0xf7) | 0x08);
+	if (ret < 0)
+		return ret;
 	usleep_range(10 * USEC_PER_MSEC, 20 * USEC_PER_MSEC);
+
+	return 0;
 }
 
-static void gvusb2_stk1150_init(struct gvusb2_vid *dev)
+static int gvusb2_stk1150_init(struct gvusb2_vid *dev)
 {
-	gvusb2_stk1150_reset_gpio(dev);
-	gvusb2_stk1150_reset_slave_ics(dev);
-	gvusb2_stk1150_init_inner(dev);
+	int ret;
+
+	ret = gvusb2_stk1150_reset_gpio(dev);
+	if (ret < 0)
+		return ret;
+
+	ret = gvusb2_stk1150_reset_slave_ics(dev);
+	if (ret < 0)
+		return ret;
+
+	return gvusb2_stk1150_init_inner(dev);
 }
 
 /*****************************************************************************
@@ -405,8 +426,8 @@ static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
 		if (usb_endpoint_dir_in(e) &&
 				e->bEndpointAddress == 0x82 &&
 				usb_endpoint_xfer_isoc(e) &&
-				/* this corresponds to max 0xc00 bytes */
-				e->wMaxPacketSize == 0x1400) {
+				/* 3 x 0x400 per microframe, max 0xc00 bytes */
+				le16_to_cpu(e->wMaxPacketSize) == 0x1400) {
 			*video_ep = e;
 			gvusb2_dbg(&intf->dev,
 				"found video at altsetting %d endpoint %d\n",
@@ -415,18 +436,16 @@ static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
 	}
 }
 
-int gvusb2_vid_free(struct gvusb2_vid *dev)
+static void gvusb2_vid_free(struct gvusb2_vid *dev)
 {
 	/* free urbs */
 	gvusb2_vid_free_urbs(dev);
 
-	/* free gvusb2 */
+	/* drop our usb_device reference */
 	gvusb2_free(&dev->gv);
 
 	/* free me */
 	kfree(dev);
-
-	return 0;
 }
 
 void gvusb2_release(struct v4l2_device *v4l2_dev)
@@ -434,10 +453,15 @@ void gvusb2_release(struct v4l2_device *v4l2_dev)
 	struct gvusb2_vid *dev =
 		container_of(v4l2_dev, struct gvusb2_vid, v4l2_dev);
 
-	gvusb2_i2c_unregister(dev);
-
-	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	/*
+	 * Unregister the v4l2 device first. That also unregisters the
+	 * tw9910 i2c client properly, so the adapter is empty by the time
+	 * it gets deleted.
+	 */
 	v4l2_device_unregister(&dev->v4l2_dev);
+	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+
+	gvusb2_i2c_unregister(dev);
 
 	mutex_destroy(&dev->v4l2_lock);
 	mutex_destroy(&dev->vb2q_lock);
@@ -445,20 +469,24 @@ void gvusb2_release(struct v4l2_device *v4l2_dev)
 	gvusb2_vid_free(dev);
 }
 
-int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
+static int gvusb2_vid_probe(struct usb_interface *intf,
+	const struct usb_device_id *id)
 {
 	struct usb_device *udev;
 	struct gvusb2_vid *dev;
 	int i, ret;
 	struct usb_endpoint_descriptor *video_ep = NULL;
+	struct usb_host_interface *video_alt = NULL;
 
 	udev = interface_to_usbdev(intf);
 
 	/* check if we're on the video interface */
 	for (i = 0; i < intf->num_altsetting; i++) {
 		gvusb2_vid_check_altsetting(intf, i, &video_ep);
-		if (video_ep != NULL)
+		if (video_ep != NULL) {
+			video_alt = &intf->altsetting[i];
 			break;
+		}
 	}
 
 	/* if we don't have a video device, we don't accept */
@@ -475,8 +503,9 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (ret < 0)
 		goto free_dev;
 
-	/* XXX: No hardcoding here. */
-	ret = usb_set_interface(udev, 0, 5);
+	/* select the altsetting that carries the video endpoint */
+	ret = usb_set_interface(udev, video_alt->desc.bInterfaceNumber,
+		video_alt->desc.bAlternateSetting);
 	if (ret < 0)
 		goto free_gvusb2;
 
@@ -485,10 +514,12 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	dev->intf = intf;
 
 	/* initialize the stk1150 in the gvusb2 */
-	gvusb2_stk1150_init(dev);
+	ret = gvusb2_stk1150_init(dev);
+	if (ret < 0)
+		goto free_gvusb2;
 
 	/* allocate URBs */
-	gvusb2_vid_allocate_urbs(dev);
+	ret = gvusb2_vid_allocate_urbs(dev);
 	if (ret < 0)
 		goto free_gvusb2;
 
@@ -503,7 +534,7 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		goto unregister_i2c;
 	ret = gvusb2_v4l2_register(dev);
 	if (ret < 0)
-		goto unregister_i2c;
+		goto destroy_vb2_lock;
 	ret = gvusb2_video_register(dev);
 	if (ret < 0)
 		goto unregister_v4l2;
@@ -515,6 +546,8 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 unregister_v4l2:
 	gvusb2_v4l2_unregister(dev);
+destroy_vb2_lock:
+	mutex_destroy(&dev->vb2q_lock);
 unregister_i2c:
 	gvusb2_i2c_unregister(dev);
 free_urbs:
@@ -527,34 +560,29 @@ free_dev:
 	return ret;
 }
 
-void gvusb2_vid_disconnect(struct usb_interface *intf)
+static void gvusb2_vid_disconnect(struct usb_interface *intf)
 {
 	struct gvusb2_vid *dev;
 
 	/* remove our data from the interface */
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
+	if (dev == NULL)
+		return;
 
-	mutex_lock(&dev->vb2q_lock);
+	/*
+	 * Unregister the video node and release the vb2 queue in one go.
+	 * If an app is streaming, this runs stop_streaming now, which kills
+	 * the URBs and hands every buffer back, instead of waiting for the
+	 * app to notice the device is gone.
+	 */
+	vb2_video_unregister_device(&dev->vdev);
+
 	mutex_lock(&dev->v4l2_lock);
-
-	/* cancel urbs */
-	gvusb2_vid_cancel_urbs(dev);
-	gvusb2_vid_free_urbs(dev);
-
-	/* clear buffer list queue */
-	gvusb2_vid_clear_queue(dev);
-
-	/* clean up v4l2 */
-	video_unregister_device(&dev->vdev);
 	v4l2_device_disconnect(&dev->v4l2_dev);
-
-	/* make udev NULL? */
-
 	mutex_unlock(&dev->v4l2_lock);
-	mutex_unlock(&dev->vb2q_lock);
 
-	/* decrease v4l2 refcount */
+	/* drop our reference, gvusb2_release() runs once userspace lets go */
 	v4l2_device_put(&dev->v4l2_dev);
 }
 
