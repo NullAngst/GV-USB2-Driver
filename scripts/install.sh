@@ -259,19 +259,72 @@ NOT_ROOT_ONLY=(\( ! -user 0
 NOT_ROOT_ONLY_STRICT=(\( ! -user 0 -o -perm -0002
 	-o \( -perm -0020 ! -group 0 \) \))
 
-# has_acl [-R] PATH...: succeed if any PATH (with -R, anything under it)
-# carries an extended ACL. Mode bits can't show those, and one can give a
-# named user write access. getfacl ships in the same package as setfacl,
-# so where it's missing, no ACL was likely ever set.
-has_acl() {
-	local opts=(-s -p)
+# acl_write UIDS GIDS [-R] PATH...: succeed, and print the first offender,
+# if an ACL on any PATH (with -R, anything under it) gives write access to
+# a user or group outside the space-separated UIDS and GIDS lists. Mode
+# bits can't show those, which is why find -perm alone isn't enough.
+# Entries that only grant read or search are fine, and so is any entry
+# whose write bit the ACL mask removes. Desktop setups often add
+# read-only entries to home directories. Owner and "other" permissions
+# are left to the find checks, which already see them in the mode bits.
+# getfacl ships in the same package as setfacl, so where it's missing, no
+# ACL was likely ever set.
+acl_write() {
+	local uids=" $1 " gids=" $2 " out
+	local opts=(-s -p -n)
 
+	shift 2
 	if [ "$1" = -R ]; then
 		opts+=(-R -P)
 		shift
 	fi
 	command -v getfacl >/dev/null 2>&1 || return 1
-	[ -n "$(getfacl "${opts[@]}" -- "$@" 2>/dev/null)" ]
+	# Decide on what awk prints, never on the pipeline's exit status:
+	# getfacl can exit non-zero or die of SIGPIPE when awk stops early,
+	# and under pipefail either would read as "nothing found".
+	out=$(getfacl "${opts[@]}" -- "$@" 2>/dev/null | awk -v uids="$uids" -v gids="$gids" '
+		function check(   i, f, def, kind, id, perm, mk) {
+			for (i = 1; i <= n; i++) {
+				split(ent[i], f, ":")
+				def = (f[1] == "default")
+				if (def) { kind = f[2]; id = f[3]; perm = f[4] }
+				else { kind = f[1]; id = f[2]; perm = f[3] }
+				if (index(perm, "w") == 0)
+					continue
+				mk = def ? dmask : mask
+				if (mk != "" && index(mk, "w") == 0)
+					continue
+				if (kind == "user" && id != "" && index(uids, " " id " ") == 0)
+					return ent[i]
+				if (kind == "group") {
+					if (id == "")
+						id = grp
+					if (index(gids, " " id " ") == 0)
+						return ent[i]
+				}
+			}
+			return ""
+		}
+		function finish(   bad) {
+			if (file != "" && (bad = check()) != "") {
+				printf "%s (its ACL entry %s gives write access)", file, bad
+				found = 1
+				exit
+			}
+		}
+		/^# file: / { finish(); file = substr($0, 9); n = 0; mask = ""; dmask = ""; next }
+		/^# group: / { grp = substr($0, 10); next }
+		/^#/ || /^$/ { next }
+		{
+			split($0, f, ":")
+			if (f[1] == "mask") mask = f[3]
+			else if (f[1] == "default" && f[2] == "mask") dmask = f[4]
+			else ent[++n] = $0
+		}
+		END { if (!found) finish() }
+	' || true)
+	[ -n "$out" ] || return 1
+	printf '%s' "$out"
 }
 
 # root_only PATH: succeed if PATH exists and only root can change it.
@@ -303,7 +356,7 @@ trusted_root_path() {
 		fi
 		dir=$(dirname -- "$dir")
 	done
-	! has_acl "${chain[@]}"
+	! acl_write 0 0 "${chain[@]}" >/dev/null
 }
 
 # mine_only DIR: succeed if DIR, every directory above it, and everything
@@ -327,8 +380,8 @@ mine_only() {
 		printf '%s' "$bad"
 		return 1
 	fi
-	if has_acl -R "$dir"; then
-		printf '%s (has an ACL)' "$dir"
+	if bad=$(acl_write "0 $uid" "0 $gid" -R "$dir"); then
+		printf '%s' "$bad"
 		return 1
 	fi
 	while [ "$dir" != / ]; do
@@ -342,8 +395,8 @@ mine_only() {
 		fi
 		chain+=("$dir")
 	done
-	if has_acl "${chain[@]}"; then
-		printf 'a directory above %s (has an ACL)' "$1"
+	if bad=$(acl_write "0 $uid" "0 $gid" "${chain[@]}"); then
+		printf '%s' "$bad"
 		return 1
 	fi
 	return 0
@@ -359,7 +412,7 @@ moddir_ok() {
 	fi
 	trusted_root_path "$dir" &&
 		[ -z "$(find "$dir" -type d "${NOT_ROOT_ONLY_STRICT[@]}" -print 2>/dev/null)" ] &&
-		! has_acl -R "$dir"
+		! acl_write 0 0 -R "$dir" >/dev/null
 }
 
 # remove_old_modules KERNEL [KEEP_DIR]: delete every gvusb2 module file
@@ -656,7 +709,7 @@ fi
 # An existing checkout gets git commands run on it, and git honors config
 # inside the repo, so check who can change it before touching it.
 if [ -e "$src_dir" ] && ! bad=$(mine_only "$src_dir"); then
-	die "$bad can be changed by someone other than you or root, so using $src_dir would run their code as you. Clone the repo somewhere you own, like your home directory."
+	die "$bad can be changed by someone other than you or root, so using $src_dir would run their code as you. See who with: getfacl -p <that path>, or ls -ld <that path>. Fix the permissions, or clone somewhere only you can write to."
 fi
 
 if [ "$in_repo" -eq 1 ]; then
@@ -697,7 +750,7 @@ fi
 # root) may be able to change it. This catches a checkout somewhere
 # shared, like files another user left in /tmp.
 if ! bad=$(mine_only "$src_dir"); then
-	die "$bad can be changed by someone other than you or root, so building $src_dir would run their code as you and install the result. Clone the repo somewhere you own, like your home directory."
+	die "$bad can be changed by someone other than you or root, so building $src_dir would run their code as you and install the result. See who with: getfacl -p <that path>, or ls -ld <that path>. Fix the permissions, or clone somewhere only you can write to."
 fi
 
 log=$(mktemp "${TMPDIR:-/tmp}/gvusb2-build.XXXXXX")
