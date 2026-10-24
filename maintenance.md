@@ -128,6 +128,10 @@ If you want to go further, run steps 4 to 11 on a kernel built with `CONFIG_KASA
 
 Look at the original GV-USB2-Driver this was forked from (Isaac Lozano's) and any active forks for fixes worth pulling in. Check the issue tracker for bug reports while you're at it.
 
+Forks already reviewed, so you only need to look at commits newer than these:
+
+- jkl1337/GV-USB2-Driver, up to 7423642 (2026-05-08). Its vb2 wait-op removal was already covered here with a version guard. Its per-device ALSA `index`/`id`/`enable` arrays were ported in a reworked form, since the original never advanced its device counter.
+
 ## 7. Close out
 
 1. Update "Last review" and "Next review due" at the top
@@ -140,3 +144,4 @@ Look at the original GV-USB2-Driver this was forked from (Isaac Lozano's) and an
 | Date | Kernels built | Hardware tested | Notes |
 |---|---|---|---|
 | 2026-10-23 | 6.8, 6.14, 6.17, 7.0 (Ubuntu), mainline 7.4 merge window | No | Fixed build on 7.0+ (vb2 wait ops, strncpy), i2c busy-wait hang on unplug, ALSA crashes around open, close and unplug, ALSA index default, PAL frame size, unchecked errors throughout. Split shared code into gvusb2-core. Added install and update scripts. |
+| 2026-10-23 | same | No | Reviewed jkl1337's fork. Ported per-device ALSA `index`/`id`/`enable` module parameters, with slot tracking. |

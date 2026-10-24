@@ -76,6 +76,18 @@ Could be `/dev/video2` or something else on your machine, `v4l2-ctl --list-devic
 
 There are two extra controls, "Vertical Start" and "Horizontal Start", that shift the capture window if the picture is cut off at an edge.
 
+## More than one GV-USB2
+
+Each device gets its own `/dev/videoN` and its own ALSA card. By default the cards are named `gvusb2`, `gvusb2_1` and so on, and get the first free card numbers, in the order they're plugged in.
+
+To pin them, set the usual ALSA module options, one comma-separated entry per device in plug order. For example, in `/etc/modprobe.d/gvusb2.conf`:
+
+```
+options gvusb2-sound index=5,6 id=capA,capB
+```
+
+Then the first one is `hw:CARD=capA`, the second `hw:CARD=capB`. `enable=1,0` would skip the second device's audio entirely. Plug order is the only thing that decides which device is which, so if that matters, plug them in one at a time.
+
 ## Troubleshooting
 
 - `modprobe: ERROR: could not insert 'gvusb2_core': Key was rejected by service`: the module is signed with a key that isn't enrolled. See Secure Boot above.

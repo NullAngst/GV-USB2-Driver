@@ -11,6 +11,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <sound/core.h>
@@ -26,17 +27,25 @@ MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
 
 /*
- * Default to the first free slot. The old default of 0 failed with
- * -EBUSY whenever onboard audio already held card 0.
+ * One entry per plugged-in GV-USB2, in plug order, same as snd-usb-audio.
+ * The index default of -1 takes the first free ALSA card number. The old
+ * default of 0 failed with -EBUSY whenever onboard audio held card 0.
  */
-static int card_index = SNDRV_DEFAULT_IDX1;
-static char *card_id = SNDRV_DEFAULT_STR1;
+static int card_index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
+static char *card_id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static bool card_enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
-/* exposed as index= and id= like every other ALSA driver */
-module_param_named(index, card_index, int, 0444);
+/* exposed as index=, id= and enable= like every other ALSA driver */
+module_param_array_named(index, card_index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
-module_param_named(id, card_id, charp, 0444);
+module_param_array_named(id, card_id, charp, NULL, 0444);
 MODULE_PARM_DESC(id, "ID string for " CARD_NAME " soundcard.");
+module_param_array_named(enable, card_enable, bool, NULL, 0444);
+MODULE_PARM_DESC(enable, "Enable " CARD_NAME " soundcard.");
+
+/* which of the slots above belong to a card that still exists */
+static DEFINE_MUTEX(gvusb2_snd_slots_lock);
+static bool gvusb2_snd_slot_used[SNDRV_CARDS];
 
 static const struct usb_device_id gvusb2_id_table[] = {
 	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
@@ -56,6 +65,7 @@ struct gvusb2_snd {
 	/* alsa */
 	struct snd_card *card;
 	struct snd_pcm *pcm;
+	int slot;		/* index into the module parameter arrays */
 
 	/* everything below is protected by lock */
 	spinlock_t lock;
@@ -415,6 +425,36 @@ free_urbs:
  * Driver Stuff
  ****************************************************************************/
 
+/*
+ * Claim the first enabled slot that no live card holds. A slot stays
+ * taken until its card is freed, which can be after the device is
+ * unplugged if an app still has it open, so a quick replug never gets
+ * handed an index= that is still in use.
+ */
+static int gvusb2_snd_claim_slot(void)
+{
+	int i, slot = -ENODEV;
+
+	mutex_lock(&gvusb2_snd_slots_lock);
+	for (i = 0; i < SNDRV_CARDS; i++) {
+		if (card_enable[i] && !gvusb2_snd_slot_used[i]) {
+			gvusb2_snd_slot_used[i] = true;
+			slot = i;
+			break;
+		}
+	}
+	mutex_unlock(&gvusb2_snd_slots_lock);
+
+	return slot;
+}
+
+static void gvusb2_snd_release_slot(int slot)
+{
+	mutex_lock(&gvusb2_snd_slots_lock);
+	gvusb2_snd_slot_used[slot] = false;
+	mutex_unlock(&gvusb2_snd_slots_lock);
+}
+
 /* runs when the card is finally freed, after the last close */
 static void gvusb2_snd_card_free(struct snd_card *card)
 {
@@ -422,6 +462,7 @@ static void gvusb2_snd_card_free(struct snd_card *card)
 
 	gvusb2_snd_free_isoc(dev);
 	gvusb2_free(&dev->gv);
+	gvusb2_snd_release_slot(dev->slot);
 }
 
 static int gvusb2_snd_probe(struct usb_interface *intf,
@@ -430,7 +471,7 @@ static int gvusb2_snd_probe(struct usb_interface *intf,
 	struct usb_device *udev;
 	struct snd_card *card;
 	struct gvusb2_snd *dev;
-	int i, ret;
+	int i, ret, slot;
 	struct usb_endpoint_descriptor *audio_ep = NULL;
 	struct usb_host_interface *audio_alt = NULL;
 
@@ -468,23 +509,38 @@ static int gvusb2_snd_probe(struct usb_interface *intf,
 	if (audio_ep == NULL)
 		return -ENODEV;
 
+	slot = gvusb2_snd_claim_slot();
+	if (slot < 0) {
+		dev_err(&intf->dev,
+			"no free " CARD_NAME " sound slot, check the enable= module parameter\n");
+		return slot;
+	}
+
 	/* our state is allocated as part of the card */
-	ret = snd_card_new(&intf->dev, card_index, card_id, THIS_MODULE,
-		sizeof(*dev), &card);
-	if (ret < 0)
+	ret = snd_card_new(&intf->dev, card_index[slot], card_id[slot],
+		THIS_MODULE, sizeof(*dev), &card);
+	if (ret < 0) {
+		gvusb2_snd_release_slot(slot);
 		return ret;
+	}
 
 	dev = card->private_data;
 	dev->card = card;
 	dev->intf = intf;
 	dev->ep = audio_ep;
+	dev->slot = slot;
 	spin_lock_init(&dev->lock);
+
+	/*
+	 * From here on snd_card_free() cleans up everything, slot included.
+	 * gvusb2_snd_card_free() copes with the parts not set up yet.
+	 */
+	card->private_free = gvusb2_snd_card_free;
 
 	/* initialize gvusb2 core stuff */
 	ret = gvusb2_init(&dev->gv, udev);
 	if (ret < 0)
 		goto free_card;
-	card->private_free = gvusb2_snd_card_free;
 
 	/* select the altsetting that carries the audio endpoint */
 	ret = usb_set_interface(udev, audio_alt->desc.bInterfaceNumber,
@@ -513,7 +569,7 @@ static int gvusb2_snd_probe(struct usb_interface *intf,
 	return 0;
 
 free_card:
-	/* runs gvusb2_snd_card_free() once private_free is set */
+	/* runs gvusb2_snd_card_free() */
 	snd_card_free(card);
 
 	return ret;
