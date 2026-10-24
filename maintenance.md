@@ -7,7 +7,7 @@ Why bother? Because out-of-tree modules rot. The kernel's internal API has no st
 
 Schedule: April and October, a few weeks after the Ubuntu release, since that's when a new distro kernel lands for most people.
 
-- Last review: 2026-10-23
+- Last review: 2026-10-24
 - Next review due: 2027-04
 
 ## What you need
@@ -112,11 +112,25 @@ If you want to go further, run steps 4 to 11 on a kernel built with `CONFIG_KASA
 ## 5. Scripts
 
 1. `shellcheck scripts/*.sh`, no warnings
-2. Test `install.sh` on a distro or two that isn't yours. A container works for the build step, since it only needs headers:
+1.5. Check the scripts' security rules still hold. These came out of the October 2026 security review and are easy to break by accident:
+   - Kernel versions from `-k` and from `/lib/modules` go through `valid_kver` before they touch a path.
+   - Every kernel's module directory passes `moddir_ok` before anything is deleted or installed, for all kernels up front. A kernel that then fails to build is skipped, untouched, and the rest carry on; the run lists it and exits non-zero.
+   - The checkout and every kernel header tree pass `mine_only` before git or make touch them: owned by the user or root, writable by nobody else, no ACLs. The checkout is only taken from the script's location when the script really sits in a checkout's `scripts/` folder.
+   - Every root-only check also runs `has_acl`, since `find -perm` can't see ACLs.
+   - Files deleted as root go through `remove_old_modules` (`find ... -exec rm`), never a `while read` loop over `find` output, since newlines in file names turn into extra paths.
+   - New modules are staged as `.staged-<name>.ko`, checked, signed, and only then swapped in, so a failure leaves the old install working. The exit trap removes staged files on any exit, Ctrl-C included, and `remove_old_modules` (so `-u`) also removes stale ones.
+   - Both scripts refuse to run as root, before any git command, so git and `make` only ever run as the user. Nothing from a kernel build tree runs as root unless it passes `trusted_root_path`, and today that's only `sign-file`.
+   - Root never opens a path in the user's checkout. Built modules are streamed in through the user's shell (`< file` into `as_root sh -c 'cat > ...'`), never `as_root cp`, and each staged copy must report the target kernel's vermagic before it's signed. A plain `as_root cp` there leaks the signing key, which the third review reproduced.
+   - Swaps rename each staged module over its old copy first, and only then delete old copies elsewhere.
+   - New code reaches the kernel only through `update.sh`'s review, a first clone, or commits you made locally. `install.sh` refuses `-b` on an existing clone and sends new upstream commits to `update.sh`.
+   - `update.sh` sends everything it shows through `clean()`, never raw `git log` or `git diff` output to the terminal. Diffs use `--text --no-renames --no-ext-diff --no-textconv`, file lists use `--no-renames`, and symlinks, `.gitattributes` or `.gitmodules` anywhere in the tree make every change count as code.
+   - `scripts/*.sh` are mode 100755 in git: `git ls-files -s scripts`. Commit from the command line, since the web uploader drops it.
+   - Both scripts need bash 4.4 or newer and check for it.
+2. Test `install.sh` on a distro or two that isn't yours. A container works for the build step, since it only needs headers. The script refuses to run as root, so the container makes a user and builds from a copy that user owns:
 
    ```
-   podman run --rm -v "$PWD":/src:Z docker.io/library/fedora:latest bash -c \
-     'dnf install -y kernel-devel gcc make git kmod && k=$(ls /usr/src/kernels | head -n 1) && mkdir -p /lib/modules/$k && ln -s /usr/src/kernels/$k /lib/modules/$k/build && /src/scripts/install.sh -k "$k" -n'
+   podman run --rm -v "$PWD":/src:ro,Z docker.io/library/fedora:latest bash -c \
+     'dnf install -y kernel-devel gcc make git kmod findutils && k=$(ls /usr/src/kernels | head -n 1) && mkdir -p /lib/modules/$k && ln -s /usr/src/kernels/$k /lib/modules/$k/build && useradd -m b && cp -r /src /home/b/src && chown -R b:b /home/b/src && su b -c "/home/b/src/scripts/install.sh -k $k -n"'
    ```
 
    The symlink is there since `kernel-devel` alone doesn't create `/lib/modules/<version>/build`, the kernel package does. On Ubuntu, `apt-get install -y linux-headers-generic` creates it for you, so use `ls /lib/modules` to get the version. Same idea for whichever distro you want to check. Docker works the same.
@@ -132,6 +146,10 @@ Forks already reviewed, so you only need to look at commits newer than these:
 
 - jkl1337/GV-USB2-Driver, up to 7423642 (2026-05-08). Its vb2 wait-op removal was already covered here with a version guard. Its per-device ALSA `index`/`id`/`enable` arrays were ported in a reworked form, since the original never advanced its device counter.
 
+## 6.5. Independent review
+
+Whoever writes a change shouldn't be the only one checking it. So once a year, or after any big change, have someone or something that didn't write the code do a security pass. Hand them only the repo URL, not my notes, so they can't inherit my assumptions. The October 2026 pass is summarized in the log below.
+
 ## 7. Close out
 
 1. Update "Last review" and "Next review due" at the top
@@ -145,3 +163,7 @@ Forks already reviewed, so you only need to look at commits newer than these:
 |---|---|---|---|
 | 2026-10-23 | 6.8, 6.14, 6.17, 7.0 (Ubuntu), mainline 7.4 merge window | No | Fixed build on 7.0+ (vb2 wait ops, strncpy), i2c busy-wait hang on unplug, ALSA crashes around open, close and unplug, ALSA index default, PAL frame size, unchecked errors throughout. Split shared code into gvusb2-core. Added install and update scripts. |
 | 2026-10-23 | same | No | Reviewed jkl1337's fork. Ported per-device ALSA `index`/`id`/`enable` module parameters, with slot tracking. |
+| 2026-10-24 | same | No | Independent security review: nothing malicious, nothing hidden. Fixed what it found. Scripts: `-k` path traversal plus a newline injection in a root `rm` (reproduced, then fixed), `sign-file` run as root from a user-writable tree, a missing `--` on git checkout. Added a review-and-confirm step to `update.sh`, and `install.sh` now sends new commits through it. Driver: S_STD racing REQBUFS (now caught in buf_prepare), unlocked GPIO read-modify-write shared by both drivers, i2c wait now bounded by time instead of attempts, CREATE_BUFS no longer bumped to 4 buffers. |
+| 2026-10-24 | same | No | Second independent review, of those fixes: all nine confirmed fixed. Fixed the follow-ups it found: signing refusal killed installs with Secure Boot off and could leave old modules deleted (now warns and installs unsigned, and installs are staged), review screen spoofable with escape sequences and Unicode (output cleaned), a symlink could make code look like docs, running as root let a user-owned tree run build tools as root (now refused), a narrow race could trip a vb2 WARN (payload clamped), `-b` could build an unreviewed branch, diverged history blocked kernel rebuilds, one bad kernel aborted multi-kernel runs midway, docs overstated what the scripts guarantee. |
+| 2026-10-24 | same | No | Third independent review, of the follow-ups. Fixed: the signing key could be copied world-readable into /lib/modules by a symlink swap in the checkout (root used `cp` on a user path; reproduced), git ran as root before the root check, a NUL byte or `.gitattributes` could hide a file from the review as "binary", a rename to `.md` was labeled docs, CR/VT/FF didn't trigger the warning. The root-mode tree check had several bypasses (symlink parents, sticky directories, `make O=` builds), so root runs are now refused instead. Documented that any tool signing modules built in your account can be fed a swapped module by code running as you. |
+| 2026-10-24 | same | No | Fourth independent review, of the whole patch: no path to root from upstream or a USB device, key-leak fix holds, review screen held. Fixed: `install.sh` built whatever directory sat above it with no ownership check, so files another user left in `/tmp` got built and installed (reproduced); ACLs got past the root-only checks; one kernel failing to build stopped later kernels; staged files left behind by an interrupted install got indexed by depmod; declining an update skipped the rebuild of what was already installed; header trees weren't checked before make ran them. Docs corrected. |

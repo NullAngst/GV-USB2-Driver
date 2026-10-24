@@ -179,21 +179,36 @@ static int gvusb2_vb2_queue_setup(struct vb2_queue *vb2q,
 	get_resolution(dev, &width, &height);
 	size = width * height * 2;
 
-	/* clamp buffers to how much we want */
-	if (*nbuffers < 4)
-		*nbuffers = 4;
-
-	/* the program is actually wanting to set up a queue */
+	/* CREATE_BUFS: the program picked the size, check it fits a frame */
 	if (*nplanes) {
 		if (*nplanes != 1 || sizes[0] < size)
 			return -EINVAL;
 		return 0;
 	}
 
-	/* the program is asking what we want for a queue*/
-	/* answer with what we want */
+	/* REQBUFS: ask for at least 4 buffers and one frame per buffer */
+	if (*nbuffers < 4)
+		*nbuffers = 4;
 	*nplanes = 1;
 	sizes[0] = size;
+
+	return 0;
+}
+
+/*
+ * S_STD runs under v4l2_lock and REQBUFS under vb2q_lock, so a standard
+ * change can slip in while buffers are being allocated for the old one.
+ * Checking every buffer against the current frame size when it is queued
+ * turns that into a clean -EINVAL instead of truncated frames.
+ */
+static int gvusb2_vb2_buf_prepare(struct vb2_buffer *vb)
+{
+	struct gvusb2_vid *dev = vb2_get_drv_priv(vb->vb2_queue);
+	int width, height;
+
+	get_resolution(dev, &width, &height);
+	if (vb2_plane_size(vb, 0) < (unsigned long)width * height * 2)
+		return -EINVAL;
 
 	return 0;
 }
@@ -301,6 +316,7 @@ static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
 
 static const struct vb2_ops gvusb2_vb2_ops = {
 	.queue_setup     = gvusb2_vb2_queue_setup,
+	.buf_prepare     = gvusb2_vb2_buf_prepare,
 	.buf_queue       = gvusb2_vb2_buf_queue,
 	.start_streaming = gvusb2_vb2_start_streaming,
 	.stop_streaming  = gvusb2_vb2_stop_streaming,

@@ -94,11 +94,18 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 static inline void gvusb2_vid_submit_video_buffer(struct gvusb2_vid *dev)
 {
 	struct gvusb2_vb *vb = dev->current_buf;
+	int width, height;
 
-	/* submit buffer */
-	/* TODO: Do we set this even if it's too small? */
+	/*
+	 * One frame of data, even if CREATE_BUFS gave us a bigger buffer.
+	 * buf_prepare checks the buffer holds a frame, but a standard change
+	 * racing REQBUFS can still leave a smaller one here, and asking vb2
+	 * for more payload than the plane holds trips a WARN.
+	 */
+	get_resolution(dev, &width, &height);
 	vb2_set_plane_payload(&vb->vb.vb2_buf, 0,
-		vb->vb.vb2_buf.planes[0].length);
+		min_t(unsigned long, (unsigned long)width * height * 2,
+			vb2_plane_size(&vb->vb.vb2_buf, 0)));
 
 	vb->vb.sequence = dev->sequence++;
 	vb->vb.field = V4L2_FIELD_INTERLACED;
@@ -372,19 +379,17 @@ static int gvusb2_stk1150_init_inner(struct gvusb2_vid *dev)
 static int gvusb2_stk1150_reset_slave_ics(struct gvusb2_vid *dev)
 {
 	int ret;
-	u8 reg_0000;
 
-	ret = gvusb2_read_reg(&dev->gv, 0x0000, &reg_0000);
-	if (ret < 0)
-		return ret;
-
-	/* toggle video decoder slave reset pins via GPIO */
-	ret = gvusb2_write_reg(&dev->gv, 0x0000, reg_0000 & 0xf7);
+	/*
+	 * Pulse the video decoder reset pin (GPIO bit 3, active low). Going
+	 * through set_reg_mask keeps the sound driver's GPIO bits intact.
+	 */
+	ret = gvusb2_set_reg_mask(&dev->gv, 0x0000, 0x08, 0x00);
 	if (ret < 0)
 		return ret;
 	usleep_range(10 * USEC_PER_MSEC, 20 * USEC_PER_MSEC);
 
-	ret = gvusb2_write_reg(&dev->gv, 0x0000, (reg_0000 & 0xf7) | 0x08);
+	ret = gvusb2_set_reg_mask(&dev->gv, 0x0000, 0x08, 0x08);
 	if (ret < 0)
 		return ret;
 	usleep_range(10 * USEC_PER_MSEC, 20 * USEC_PER_MSEC);

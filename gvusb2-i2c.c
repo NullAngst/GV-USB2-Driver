@@ -12,32 +12,41 @@
 
 #include <linux/i2c.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/usb.h>
 #include <linux/version.h>
 
 #include "gvusb2.h"
 #include "gvusb2-vid.h"
 
+/*
+ * An i2c byte at our clock divider takes well under a millisecond. The old
+ * 100-poll loop gave up after roughly 12 to 100 ms depending on the host,
+ * so this keeps the same upper end.
+ */
+#define GVUSB2_I2C_TIMEOUT_MS 100
+
 static int gvusb2_i2c_busy_wait(struct gvusb2_vid *dev, u8 wait_mask)
 {
-	int attempts;
+	unsigned long deadline = jiffies + msecs_to_jiffies(GVUSB2_I2C_TIMEOUT_MS);
 	int ret;
 	u8 flag;
 
 	/*
-	 * Each poll is a USB control transfer, so 100 attempts is already
-	 * tens of milliseconds. The old loop never counted, which hung the
-	 * kernel thread forever if the device went away mid-transfer.
+	 * Bound the wait by time, not by attempts. Each poll is a USB control
+	 * transfer, and a device that answers slowly could otherwise stretch
+	 * 100 attempts out to 100 seconds. Now the worst case is the deadline
+	 * plus one control timeout.
 	 */
-	for (attempts = 0; attempts < 100; attempts++) {
+	for (;;) {
 		ret = gvusb2_read_reg(&dev->gv, 0x0201, &flag);
 		if (ret < 0)
 			return ret;
 		if (flag & wait_mask)
 			return 0;
+		if (time_after(jiffies, deadline))
+			return -ETIMEDOUT;
 	}
-
-	return -ETIMEDOUT;
 }
 
 static int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg,

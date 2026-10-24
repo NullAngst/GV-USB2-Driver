@@ -11,6 +11,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 
@@ -72,16 +73,28 @@ int gvusb2_write_reg(struct gvusb2_dev *dev, u16 reg, u8 value)
 }
 EXPORT_SYMBOL_GPL(gvusb2_write_reg);
 
+/*
+ * The video and sound drivers each have their own gvusb2_dev but share
+ * registers like the GPIO block at 0x0000/0x0002. One lock in this shared
+ * module keeps a read-modify-write from one driver from undoing the
+ * other's bits when both probe at once.
+ */
+static DEFINE_MUTEX(gvusb2_rmw_lock);
+
 int gvusb2_set_reg_mask(struct gvusb2_dev *dev, u16 reg, u8 mask, u8 value)
 {
 	int ret;
 	u8 reg_val;
 
-	ret = gvusb2_read_reg(dev, reg, &reg_val);
-	if (ret < 0)
-		return ret;
+	mutex_lock(&gvusb2_rmw_lock);
 
-	return gvusb2_write_reg(dev, reg, (reg_val & ~mask) | value);
+	ret = gvusb2_read_reg(dev, reg, &reg_val);
+	if (ret >= 0)
+		ret = gvusb2_write_reg(dev, reg, (reg_val & ~mask) | value);
+
+	mutex_unlock(&gvusb2_rmw_lock);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(gvusb2_set_reg_mask);
 
