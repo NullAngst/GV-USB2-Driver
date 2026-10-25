@@ -35,6 +35,10 @@ struct gvusb2_vb {
 	int buf_pos;
 	int line_pos;
 	int field;
+	/* a packet inside this frame failed or went missing */
+	bool damaged;
+	/* a field start was missed, so two frames ran into this buffer */
+	bool overflow;
 };
 
 struct gvusb2_vid {
@@ -47,6 +51,8 @@ struct gvusb2_vid {
 	struct urb *urbs[GVUSB2_NUM_URBS];
 	/* keeps track of packet seq */
 	unsigned char counter;
+	/* CLOCK_MONOTONIC time of the isoc packet being parsed */
+	u64 pkt_ts;
 
 	/* i2c data */
 	struct i2c_adapter adap;

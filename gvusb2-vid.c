@@ -72,9 +72,15 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 			len_to_copy = bytes_left_in_line;
 
 		if (vb->buf_pos + len_to_copy > buffer_len) {
-			/* more lines than the frame holds, drop the rest */
-			dev_warn_ratelimited(&dev->intf->dev,
-				"buffer overflow detected.\n");
+			/*
+			 * More lines than the frame holds: a field start was
+			 * missed and the next frame ran into this buffer.
+			 * Drop the rest; submit counts the lost frame.
+			 */
+			if (!vb->overflow)
+				dev_warn_ratelimited(&dev->intf->dev,
+					"buffer overflow detected.\n");
+			vb->overflow = true;
 			return;
 		}
 
@@ -108,9 +114,24 @@ static inline void gvusb2_vid_submit_video_buffer(struct gvusb2_vid *dev)
 			vb2_plane_size(&vb->vb.vb2_buf, 0)));
 
 	vb->vb.sequence = dev->sequence++;
+	/*
+	 * Two frames ran into this buffer, so one is gone. Skip a sequence
+	 * number so userspace sees the loss instead of a short timeline.
+	 */
+	if (vb->overflow)
+		dev->sequence++;
 	vb->vb.field = V4L2_FIELD_INTERLACED;
-	vb->vb.vb2_buf.timestamp = ktime_get_ns();
-	vb2_buffer_done(&vb->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	/*
+	 * Time of the status packet that ended the frame, not of the URB
+	 * callback. A URB holds GVUSB2_NUM_ISOCH_PACKETS microframes (32 ms),
+	 * so callback time would put every frame on a 32 ms grid and make
+	 * 33.4 ms NTSC frames look like they arrive 32 or 64 ms apart.
+	 */
+	vb->vb.vb2_buf.timestamp = dev->pkt_ts;
+	/* Damaged frames still go out, flagged, so the timeline holds. */
+	vb2_buffer_done(&vb->vb.vb2_buf,
+		(vb->damaged || vb->overflow) ?
+			VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 
 	dev->current_buf = NULL;
 
@@ -122,6 +143,19 @@ static inline
 void gvusb2_vid_process_status_packet(struct gvusb2_vid *dev, u8 status_byte)
 {
 	if (dev->current_buf == NULL) {
+		/*
+		 * Only start a buffer at a frame start (odd field), so the
+		 * field lines land on the right rows.
+		 */
+		if (!(status_byte & 0x40))
+			return;
+		/*
+		 * Userspace had no buffer queued, so the frame that just
+		 * ended went nowhere. Count it once streaming has produced
+		 * a frame, so the gap shows up in the sequence numbers.
+		 */
+		if (dev->sequence)
+			dev->sequence++;
 		dev->current_buf = gvusb2_vid_next_buffer(dev);
 		return;
 	}
@@ -174,16 +208,25 @@ void gvusb2_vid_process_data(struct gvusb2_vid *dev, u8 *buf, int len)
 }
 
 static inline
-void gvusb2_vid_process_isoc(struct gvusb2_vid *dev, struct urb *urb)
+void gvusb2_vid_process_isoc(struct gvusb2_vid *dev, struct urb *urb, u64 now)
 {
 	int i;
+	int n = urb->number_of_packets;
 
-	for (i = 0; i < urb->number_of_packets; i++) {
+	for (i = 0; i < n; i++) {
 		int status = urb->iso_frame_desc[i].status;
+
+		/*
+		 * One packet per 125 us microframe (high speed, interval 1),
+		 * and the last one finished just before this callback.
+		 */
+		dev->pkt_ts = now - (u64)(n - 1 - i) * 125000;
 
 		if (status < 0) {
 			gvusb2_dbg(&dev->intf->dev,
 				"iso packet failed, skipping (%d)\n", status);
+			if (dev->current_buf != NULL)
+				dev->current_buf->damaged = true;
 		} else {
 			u8 *data = urb->transfer_buffer +
 				urb->iso_frame_desc[i].offset;
@@ -198,6 +241,7 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 {
 	int i, ret;
 	struct gvusb2_vid *dev = urb->context;
+	u64 now = ktime_get_ns();
 
 	switch (urb->status) {
 	case 0:
@@ -212,7 +256,7 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 		return;
 	}
 
-	gvusb2_vid_process_isoc(dev, urb);
+	gvusb2_vid_process_isoc(dev, urb, now);
 
 	for (i = 0; i < urb->number_of_packets; i++) {
 		urb->iso_frame_desc[i].status = 0;

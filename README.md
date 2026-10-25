@@ -113,6 +113,8 @@ Could be `/dev/video2` or something else on your machine, `v4l2-ctl --list-devic
 
 There are two extra controls, "Vertical Start" and "Horizontal Start", that shift the capture window if the picture is cut off at an edge.
 
+Each frame is timestamped (CLOCK_MONOTONIC) with the USB microframe its last field ended in, so timestamps are accurate to about 125 us. Frames the driver loses show up as gaps in the sequence numbers: one when userspace had no buffer queued, one when a missed field start ran two frames into one buffer. Frames with a failed USB packet or a merged second frame are still delivered, with `V4L2_BUF_FLAG_ERROR` set, so a capture app can keep its timeline and log them.
+
 ## More than one GV-USB2
 
 Each device gets its own `/dev/videoN` and its own ALSA card. By default the cards are named `gvusb2`, `gvusb2_1` and so on, and get the first free card numbers, in the order they're plugged in.
@@ -133,7 +135,7 @@ Then the first one is `hw:CARD=capA`, the second `hw:CARD=capB`. `enable=1,0` wo
 
 ## Status
 
-Build-tested against Ubuntu's 6.8, 6.14, 6.17 and 7.0 kernels and mainline from the 7.4 merge window, all with `W=1` and no warnings. The October 2026 fixes haven't been run on hardware yet, and PAL has never been tested on a real PAL signal. `maintenance.md` has the six-month review checklist.
+Build-tested against Ubuntu's 6.8, 6.14, 6.17 and 7.0 kernels and mainline from the 7.4 merge window, all with `W=1` and no warnings. Captures S-Video NTSC on real hardware. The timestamp and lost-frame changes from 2026-10-24 are build-tested only so far, and PAL has never been tested on a real PAL signal. `maintenance.md` has the six-month review checklist.
 
 Now the driver is installed, rebuilds with one command after a kernel update, and the GV-USB2 shows up as a normal V4L2 device and ALSA card. Tinker with the capture window controls as you see fit.
 
