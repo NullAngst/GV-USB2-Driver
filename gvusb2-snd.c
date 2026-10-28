@@ -87,9 +87,16 @@ static const struct snd_pcm_hardware gvusb2_snd_hw = {
 	.channels_min = 2,
 	.channels_max = 2,
 	.buffer_bytes_max = (128 * 1024),
-	.period_bytes_min = 0xc000,
-	.period_bytes_max = (128 * 1024),
-	.periods_min = 1,
+	/*
+	 * One URB: 256 microframes of 6 frames, 4 bytes each, so 32 ms. A
+	 * shorter period would just fire several times per URB. The old
+	 * minimum of 0xc000 (256 ms) with one period allowed left apps a
+	 * buffer smaller than two periods, and arecord's default 500 ms
+	 * buffer overran at the start.
+	 */
+	.period_bytes_min = GVUSB2_NUM_ISOCH_PACKETS * 6 * 4,
+	.period_bytes_max = (64 * 1024),
+	.periods_min = 2,
 	.periods_max = 32,
 };
 
@@ -142,6 +149,15 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 
 	substream->runtime->hw = gvusb2_snd_hw;
+
+	/*
+	 * The buffer is always a whole number of periods, so a period
+	 * boundary lands where ALSA expects one when the buffer wraps.
+	 */
+	ret = snd_pcm_hw_constraint_integer(substream->runtime,
+		SNDRV_PCM_HW_PARAM_PERIODS);
+	if (ret < 0)
+		return ret;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->substream = substream;

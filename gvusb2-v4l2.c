@@ -462,6 +462,34 @@ static int gvusb2_vidioc_querycap(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * TW9910 status, from the datasheet (Intersil FN7773):
+ *   0x01 STATUS1: bit 7 VDLOSS (no video), 6 HLOCK, 5 SLOCK (subcarrier),
+ *                 4 FIELD, 3 VLOCK, 1 MONO (no color burst), 0 DET50
+ *   0x1C SDT:     bit 7 DETSTUS (detection running), 6:4 STDNOW, 2:0 STD
+ * The tw9910 subdev powers the chip down when streaming stops, so the
+ * status is only read while streaming. Idle, the driver reports nothing,
+ * as it always did.
+ */
+#define TW9910_STATUS1		0x01
+#define TW9910_ST_VDLOSS	BIT(7)
+#define TW9910_ST_HLOCK		BIT(6)
+#define TW9910_ST_VLOCK		BIT(3)
+#define TW9910_ST_MONO		BIT(1)
+#define TW9910_ST_DET50		BIT(0)
+#define TW9910_SDT		0x1c
+#define TW9910_SDT_DETSTUS	BIT(7)
+#define TW9910_SDT_STDNOW(v)	(((v) >> 4) & 0x07)
+
+/* STATUS1 of the running decoder, or a negative error when not streaming. */
+static int gvusb2_tw9910_status(struct gvusb2_vid *dev)
+{
+	if (!vb2_is_streaming(&dev->vb2q))
+		return -EAGAIN;
+
+	return i2c_smbus_read_byte_data(&dev->i2c_client, TW9910_STATUS1);
+}
+
 static int gvusb2_vidioc_enum_input(struct file *file, void *priv,
 	struct v4l2_input *i)
 {
@@ -481,6 +509,22 @@ static int gvusb2_vidioc_enum_input(struct file *file, void *priv,
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 	i->capabilities = V4L2_IN_CAP_STD;
 	i->std = dev->vdev.tvnorms;
+
+	/* Status is only defined for the current input. */
+	if (i->index == dev->input_num) {
+		int st = gvusb2_tw9910_status(dev);
+
+		if (st >= 0) {
+			if (st & TW9910_ST_VDLOSS)
+				i->status |= V4L2_IN_ST_NO_SIGNAL;
+			if (!(st & TW9910_ST_HLOCK))
+				i->status |= V4L2_IN_ST_NO_H_LOCK;
+			if (!(st & TW9910_ST_VLOCK))
+				i->status |= V4L2_IN_ST_NO_V_LOCK;
+			if (st & TW9910_ST_MONO)
+				i->status |= V4L2_IN_ST_NO_COLOR;
+		}
+	}
 
 	return 0;
 }
@@ -531,9 +575,40 @@ static int gvusb2_vidioc_querystd(struct file *file, void *priv,
 	v4l2_std_id *std)
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
+	static const v4l2_std_id stdnow[7] = {
+		V4L2_STD_NTSC,		/* 0 NTSC (M) */
+		V4L2_STD_PAL,		/* 1 PAL (B, D, G, H, I) */
+		V4L2_STD_SECAM,		/* 2 SECAM */
+		V4L2_STD_NTSC_443,	/* 3 NTSC 4.43 */
+		V4L2_STD_PAL_M,		/* 4 PAL (M) */
+		V4L2_STD_PAL_Nc,	/* 5 PAL (CN) */
+		V4L2_STD_PAL_60,	/* 6 PAL 60 */
+	};
+	int st, sdt;
 
-	/* we can't querystd with the current tw9910 driver */
-	*std = dev->vdev.tvnorms;
+	st = gvusb2_tw9910_status(dev);
+	if (st < 0) {
+		/* Not streaming: every standard is possible, as before. */
+		*std = dev->vdev.tvnorms;
+		return 0;
+	}
+
+	if ((st & TW9910_ST_VDLOSS) || !(st & TW9910_ST_HLOCK)) {
+		*std = V4L2_STD_UNKNOWN;
+		return 0;
+	}
+
+	/*
+	 * The exact standard once auto detection has settled on one,
+	 * otherwise just the line rate.
+	 */
+	sdt = i2c_smbus_read_byte_data(&dev->i2c_client, TW9910_SDT);
+	if (sdt >= 0 && !(sdt & TW9910_SDT_DETSTUS) && TW9910_SDT_STDNOW(sdt) < 7)
+		*std = stdnow[TW9910_SDT_STDNOW(sdt)];
+	else
+		*std = (st & TW9910_ST_DET50) ? V4L2_STD_625_50 : V4L2_STD_525_60;
+
+	*std &= dev->vdev.tvnorms;
 
 	return 0;
 }

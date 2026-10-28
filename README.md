@@ -119,6 +119,10 @@ Frames are reported as `V4L2_FIELD_INTERLACED_TB`: both fields woven into one fr
 ffmpeg -i capture.mkv -map 0 -vf setfield=tff -c:v ffv1 -level 3 -slicecrc 1 -c:a copy capture_tff.mkv
 ```
 
+While streaming, the driver reports the decoder's lock state: `VIDIOC_ENUMINPUT` sets no signal, no horizontal lock, no vertical lock and no color from the TW9910's status register, and `VIDIOC_QUERYSTD` returns the standard the decoder detected (nothing when there's no signal). Capture apps use this to tell a blank or fast-forwarding tape from picture. When not streaming the decoder is powered down, so both report nothing, like they always did. `v4l2-ctl -d /dev/video0 --get-input` and `--get-detected-standard` show it while something else is capturing.
+
+The sound card's shortest period is 32 ms (one USB transfer) and every buffer holds at least two whole periods. Builds before 2026-10-28 forced 256 ms periods and allowed a buffer smaller than two of them, which made arecord's default settings overrun at the start.
+
 Each frame is timestamped (CLOCK_MONOTONIC) with the USB microframe its last field ended in, so timestamps are accurate to about 125 us. Frames the driver loses show up as gaps in the sequence numbers: one when userspace had no buffer queued, one when a missed field start ran two frames into one buffer. Frames with a failed USB packet or a merged second frame are still delivered, with `V4L2_BUF_FLAG_ERROR` set, so a capture app can keep its timeline and log them.
 
 ## More than one GV-USB2
