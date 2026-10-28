@@ -130,11 +130,19 @@ static int gvusb2_tw9910_set_crop(struct gvusb2_vid *dev)
 	if (!ret)
 		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x09,
 			vactive_lo);
-	/* hdelay 18, hactive 722 */
+	/*
+	 * hdelay 18, hactive 724. The bridge window is 1440 bytes starting
+	 * at Horizontal Start (0 to 8 bytes, so up to 4 pixels in), which
+	 * needs 720 + 4 = 724 pixels from the decoder. 722 only covered the
+	 * default start of 4. The extra 2 pixels sit past the right edge
+	 * of the window at the default, so the picture there is unchanged.
+	 * Same reasoning as the vactive values above: 240 or 288 lines plus
+	 * the largest Vertical Start of 4.
+	 */
 	if (!ret)
 		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x0a, 0x12);
 	if (!ret)
-		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x0b, 0xd2);
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x0b, 0xd4);
 
 	return ret;
 }
