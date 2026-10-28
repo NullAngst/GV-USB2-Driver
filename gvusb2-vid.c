@@ -120,7 +120,7 @@ static inline void gvusb2_vid_submit_video_buffer(struct gvusb2_vid *dev)
 	 */
 	if (vb->overflow)
 		dev->sequence++;
-	vb->vb.field = V4L2_FIELD_INTERLACED;
+	vb->vb.field = GVUSB2_FIELD_ORDER;
 	/*
 	 * Time of the status packet that ended the frame, not of the URB
 	 * callback. A URB holds GVUSB2_NUM_ISOCH_PACKETS microframes (32 ms),

@@ -113,6 +113,12 @@ Could be `/dev/video2` or something else on your machine, `v4l2-ctl --list-devic
 
 There are two extra controls, "Vertical Start" and "Horizontal Start", that shift the capture window if the picture is cut off at an edge.
 
+Frames are reported as `V4L2_FIELD_INTERLACED_TB`: both fields woven into one frame, top field first. That's what the hardware sends for NTSC and PAL. Builds before 2026-10-28 reported plain `V4L2_FIELD_INTERLACED`, which the V4L2 spec reads as bottom field first for NTSC, so NTSC captures made with them are tagged the wrong way round. The picture is fine; the tag isn't, and a bob deinterlacer then judders. To fix one of those files without touching a pixel:
+
+```
+ffmpeg -i capture.mkv -map 0 -vf setfield=tff -c:v ffv1 -level 3 -slicecrc 1 -c:a copy capture_tff.mkv
+```
+
 Each frame is timestamped (CLOCK_MONOTONIC) with the USB microframe its last field ended in, so timestamps are accurate to about 125 us. Frames the driver loses show up as gaps in the sequence numbers: one when userspace had no buffer queued, one when a missed field start ran two frames into one buffer. Frames with a failed USB packet or a merged second frame are still delivered, with `V4L2_BUF_FLAG_ERROR` set, so a capture app can keep its timeline and log them.
 
 ## More than one GV-USB2

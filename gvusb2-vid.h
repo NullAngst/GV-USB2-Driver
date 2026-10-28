@@ -25,6 +25,15 @@
 #define GVUSB2_INPUT_SVIDEO    1
 #define GVUSB2_INPUT_MAX_VAL   1
 
+/*
+ * Field order. A buffer starts at the odd field (status bit 0x40), which goes
+ * on rows 0, 2, 4..., and the even field follows on rows 1, 3, 5... So the top
+ * field is always the earlier one, for NTSC and PAL alike. Plain
+ * V4L2_FIELD_INTERLACED would mean bottom field first for 525-line video,
+ * which is wrong for this device and makes deinterlacers judder.
+ */
+#define GVUSB2_FIELD_ORDER	V4L2_FIELD_INTERLACED_TB
+
 #define GVUSB2_CID_BASE			(V4L2_CID_USER_BASE | 0xf000)
 #define GVUSB2_CID_VERTICAL_START	(GVUSB2_CID_BASE + 0)
 #define GVUSB2_CID_HORIZONTAL_START	(GVUSB2_CID_BASE + 1)

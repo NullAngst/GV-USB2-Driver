@@ -581,7 +581,7 @@ static void gvusb2_fill_pix_format(struct gvusb2_vid *dev,
 	get_resolution(dev, &width, &height);
 	pix->width = width;
 	pix->height = height;
-	pix->field = V4L2_FIELD_INTERLACED;
+	pix->field = GVUSB2_FIELD_ORDER;
 	pix->pixelformat = V4L2_PIX_FMT_UYVY;
 	pix->bytesperline = width * 2;
 	pix->sizeimage = height * width * 2;
