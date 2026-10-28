@@ -474,7 +474,6 @@ static int gvusb2_vidioc_querycap(struct file *file, void *priv,
 #define TW9910_STATUS1		0x01
 #define TW9910_ST_VDLOSS	BIT(7)
 #define TW9910_ST_HLOCK		BIT(6)
-#define TW9910_ST_VLOCK		BIT(3)
 #define TW9910_ST_MONO		BIT(1)
 #define TW9910_ST_DET50		BIT(0)
 #define TW9910_SDT		0x1c
@@ -517,10 +516,13 @@ static int gvusb2_vidioc_enum_input(struct file *file, void *priv,
 		if (st >= 0) {
 			if (st & TW9910_ST_VDLOSS)
 				i->status |= V4L2_IN_ST_NO_SIGNAL;
+			/*
+			 * VLOCK has a V4L2 flag too (NO_V_LOCK), but
+			 * v4l2-compliance rejects it on a camera input, and
+			 * no signal or no H lock already covers a lost picture.
+			 */
 			if (!(st & TW9910_ST_HLOCK))
 				i->status |= V4L2_IN_ST_NO_H_LOCK;
-			if (!(st & TW9910_ST_VLOCK))
-				i->status |= V4L2_IN_ST_NO_V_LOCK;
 			if (st & TW9910_ST_MONO)
 				i->status |= V4L2_IN_ST_NO_COLOR;
 		}
